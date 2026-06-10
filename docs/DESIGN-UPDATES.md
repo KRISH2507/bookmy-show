@@ -1,5 +1,68 @@
 # Design Evolution Log
 
+## POST-REVIEW UPDATES (Part B)
+
+### Update 1: Per-User Seat Hold Limits
+
+**Triggered By:** Panel Question #3 (seat holding abuse)
+
+**What Changed:** Added middleware to enforce max 10 seats per booking
+
+**Why Necessary:** Single user could lock 200 seats, blocking legitimate buyers
+
+**Cost:** +5ms API latency (Redis counter check)
+
+**Remaining Limitation:** User can create multiple accounts (need email verification)
+
+---
+
+### Update 2: Redis Failover Strategy
+
+**Triggered By:** Panel Question #1, #5 (Redis crashes)
+
+**What Changed:** Added Redis replica with auto-failover (ElastiCache Multi-AZ)
+
+**Why Necessary:** Redis downtime breaks all bookings (SPOF)
+
+**Cost:** +$130/month for replica (total $390/month Redis)
+
+**Remaining Limitation:** 60s failover window (connection resets)
+
+---
+
+### Update 3: CloudWatch Queue Depth Alarms
+
+**Triggered By:** Panel Question #4 (cost overruns)
+
+**What Changed:**
+- Alarm: SQS depth > 1000 messages
+- Alarm: DLQ depth > 10 messages
+- Alarm: Monthly cost > $2100
+
+**Why Necessary:** No visibility into payment processing delays
+
+**Cost:** $0 (CloudWatch alarms free tier)
+
+**Remaining Limitation:** Reactive alerts (no predictive scaling)
+
+---
+
+### Update 4: Payment Circuit Breaker
+
+**Triggered By:** Panel Question #2 (gateway downtime)
+
+**What Changed:** Fail fast after 3 consecutive payment gateway timeouts
+
+**Why Necessary:** Workers retry forever, blocking queue
+
+**Cost:** ~10% payment failures during outages (acceptable tradeoff)
+
+**Remaining Limitation:** Manual circuit reset required
+
+---
+
+## ORIGINAL DESIGN EVOLUTION (Part A)
+
 ## Version 1.0: Initial Design (Naive Approach)
 
 **Date:** May 1, 2026

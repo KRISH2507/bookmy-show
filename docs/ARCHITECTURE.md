@@ -1,126 +1,190 @@
 # System Architecture
 
-## Current Architecture Diagram
+## Production Architecture Diagram with Labelled Flows
 
 ```
-┌──────────────┐
-│   Internet   │
-└──────┬───────┘
-       │
-┌──────▼───────────────────────────────────────────────┐
-│  CloudFront CDN (Static Assets + API Cache)          │
-└──────┬───────────────────────────────────────────────┘
-       │
-┌──────▼──────────┐
-│  Route 53 DNS   │
-└──────┬──────────┘
-       │
-┌──────▼──────────────────────────────────────────────┐
-│  Application Load Balancer (ALB)                    │
-│  - SSL Termination                                  │
-│  - Health Checks                                    │
-└──────┬──────────────────────────────────────────────┘
-       │
-┌──────▼────────────────────────────────────────────┐
-│  Auto Scaling Group (6x t3.medium)                │
-│  ┌──────────────────────────────────────────────┐ │
-│  │  Node.js API Servers (Express)               │ │
-│  │  - Booking API                               │ │
-│  │  - Event API                                 │ │
-│  │  - User API                                  │ │
-│  └──────────────────────────────────────────────┘ │
-└───┬────────────────────────┬─────────────────────┘
-    │                        │
-    │ ┌──────────────────────▼───────────────────┐
-    │ │  ElastiCache Redis Cluster               │
-    │ │  (cache.r6g.large - 3 nodes)             │
-    │ │  - Event cache                           │
-    │ │  - Seat count cache                      │
-    │ │  - Distributed locks                      │
-    │ └──────────────────────────────────────────┘
-    │
-    │ ┌──────────────────────────────────────────┐
-    └─► RDS PostgreSQL (db.r5.xlarge)            │
-      │  - Primary (writes)                      │
-      │  - Read Replicas (2x db.t4g.large)       │
-      └──────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                          INTERNET                               │
+│                    (500K Concurrent Users)                      │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+                             │ HTTPS Requests
+                             │ Peak: 25,000 RPS (see README.md)
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    CloudFront CDN                               │
+│             (Global Edge Cache - $180/month)                    │
+│  • Static assets (HTML/CSS/JS/Images)                          │
+│  • Event listing page cache (TTL: 60s)                         │
+│  • Seat layout JSON cache (TTL: 24h)                           │
+└─────────────┬─────────────────────────┬─────────────────────────┘
+              │                         │
+        cache hit                  cache miss
+         (50ms)                     (continues)
+              │                         │
+              ▼                         ▼
+         Response              ┌────────────────────┐
+                              │ Application Load   │
+                              │    Balancer        │
+                              │ ($180/month incl)  │
+                              └─────────┬──────────┘
+                                        │
+                    HTTPS + Health Checks (every 10s)
+                                        │
+         ┌──────────────────────────────┼────────────────────────┐
+         │                              │                        │
+         ▼                              ▼                        ▼
+┌─────────────────┐         ┌────────────────────┐    ┌────────────────┐
+│  Node.js API    │         │   Node.js API      │    │  Node.js API   │
+│  t3.medium (1)  │   ...   │   t3.medium (2)    │    │ t3.medium (6)  │
+│  $250/mo total  │         │                    │    │  (Auto-Scale)  │
+└────────┬────────┘         └──────────┬─────────┘    └────────┬───────┘
+         │                             │                        │
+         └─────────────────────────────┼────────────────────────┘
+                                       │
+         ┌─────────────────────────────┼─────────────────────────┐
+         │                             │                         │
+         │ Redis Ops:                  │ DB Queries:             │
+         │ • SETNX lock:seat:{id}      │ • UPDATE seats          │
+         │ • GET event:{id}            │ • INSERT bookings       │
+         │ • DECR seat_count:{id}      │ • SELECT FOR reads      │
+         │                             │                         │
+         ▼                             ▼                         │
+┌──────────────────────┐    ┌────────────────────────┐          │
+│  ElastiCache Redis   │    │  RDS PostgreSQL        │          │
+│  cache.r6g.large     │    │  db.r5.xlarge          │          │
+│  ($260/month)        │    │  ($580/month)          │          │
+│                      │    │                        │          │
+│ ← Redis SETNX lock   │    │ ← Authoritative state  │          │
+│   (CONCURRENCY.md)   │    │   (SCHEMA.md)          │          │
+│                      │    │                        │          │
+│ ← Event cache        │    │ ← UUID primary keys    │          │
+│   (CACHE.md)         │    │   (SCHEMA.md)          │          │
+│                      │    │                        │          │
+│ ← Seat count cache   │    │ ← held_until TTL       │          │
+│   TTL: 60s           │    │   (SCHEMA.md)          │          │
+│   (CACHE.md)         │    │                        │          │
+└──────────────────────┘    └───────────┬────────────┘          │
+                                        │                        │
+                               Async Replication                 │
+                                  (lag: ~5s)                     │
+                                        │                        │
+                    ┌───────────────────┴───────────────┐        │
+                    │                                   │        │
+                    ▼                                   ▼        │
+          ┌──────────────────┐              ┌──────────────────┐ │
+          │  Read Replica 1  │              │  Read Replica 2  │ │
+          │  db.t4g.large    │              │  db.t4g.large    │ │
+          │  ($140/mo each)  │              │                  │ │
+          │                  │              │                  │ │
+          │ ← Analytics only │              │ ← Dashboards     │ │
+          │   (SCHEMA.md)    │              │   (README.md)    │ │
+          └──────────────────┘              └──────────────────┘ │
+                                                                  │
+         ┌────────────────────────────────────────────────────────┘
+         │
+         │ Publish Payment Message
+         │ (Non-blocking, <5ms)
+         │
+         ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                   ASYNC PAYMENT PIPELINE                         │
+│                                                                  │
+│   ┌──────────────────────────────────────────────────────────┐  │
+│   │ SQS Queue: bookmy-payment-queue                          │  │
+│   │ ($150/month incl workers)                                │  │
+│   │                                                          │  │
+│   │ ← Async payments (QUEUE.md)                             │  │
+│   │ ← Visibility timeout: 30s (QUEUE.md Section 5)          │  │
+│   │ ← MaxReceiveCount: 3                                    │  │
+│   └────────────────┬──────────────────────┬──────────────────┘  │
+│                    │                      │                     │
+│         Message available        Message failed 3x              │
+│           (poll every 1s)          (MaxReceiveCount)            │
+│                    │                      │                     │
+│                    ▼                      ▼                     │
+│         ┌─────────────────────┐   ┌──────────────────┐         │
+│         │  Lambda Workers     │   │   SQS DLQ        │         │
+│         │  (Pool: 5-50)       │   │   (Manual Fix)   │         │
+│         │  Auto-scale         │   │                  │         │
+│         └──────────┬──────────┘   │ ← Failed         │         │
+│                    │               │   payments       │         │
+│      Process payment               │   (QUEUE.md)     │         │
+│      with idempotency              └──────────────────┘         │
+│                    │                                            │
+│                    ▼                                            │
+│         ┌─────────────────────┐                                │
+│         │ Payment Gateway API │                                │
+│         │ (Stripe/Razorpay)   │                                │
+│         │ External - 3s P99   │                                │
+│         │                     │                                │
+│         │ ← Idempotency key   │                                │
+│         │   (QUEUE.md)        │                                │
+│         └──────────┬──────────┘                                │
+│                    │                                            │
+│         ┌──────────┴──────────┐                                │
+│         │                     │                                │
+│    Success (200)         Fail (402)                            │
+│         │                     │                                │
+│         ▼                     ▼                                │
+│   Update booking       Cancel booking                          │
+│   status='confirmed'   status='cancelled'                      │
+│   Release Redis lock   Release seats                           │
+│         │                     │                                │
+│         ▼                     ▼                                │
+│   ┌──────────────────────────────────────┐                    │
+│   │  SNS Topic: booking-notifications    │                    │
+│   │                                       │                    │
+│   │  ← Success/failure alerts            │                    │
+│   └─────────┬────────────────────────────┘                    │
+│             │                                                  │
+│   ┌─────────┴────────────┐                                    │
+│   │                      │                                    │
+│   ▼                      ▼                                    │
+│  SES Email          SMS Gateway                               │
+│  Confirmation       (Twilio/SNS)                              │
+│                                                               │
+└───────────────────────────────────────────────────────────────┘
 
-┌──────────────────────────────────────────────────┐
-│  Async Payment Processing                        │
-│  ┌────────────┐     ┌──────────────┐            │
-│  │ SQS Queue  │────►│ Lambda Worker │            │
-│  │ (Standard) │     │ (Node.js)     │            │
-│  └────────────┘     └───────┬──────┘            │
-│                             │                    │
-│                     ┌───────▼────────────┐       │
-│                     │ Payment Gateway    │       │
-│                     │ (Stripe/Razorpay)  │       │
-│                     └────────────────────┘       │
-└──────────────────────────────────────────────────┘
+
+MONITORING & OBSERVABILITY
+┌────────────────────────────────────────────────────┐
+│  CloudWatch Metrics + X-Ray Distributed Tracing    │
+│  • RPS, Latency (P50/P99)                         │
+│  • Redis hit rate                                  │
+│  • DB connection pool usage                        │
+│  • SQS queue depth + DLQ depth (ALARM >1000)     │
+│  • Payment success rate + circuit breaker status   │
+│  • Cost alarm ($2100 threshold)                    │
+│  ($100/month - included in S3 + Misc)             │
+└────────────────────────────────────────────────────┘
+
+POST-REVIEW IMPROVEMENTS (Part B):
+┌────────────────────────────────────────────────────┐
+│  1. Seat Hold Limiter: max 10 seats/user          │
+│  2. Redis Replica: Multi-AZ failover (+$130/mo)   │
+│  3. Queue Depth Alarms: SQS >1000, DLQ >10        │
+│  4. Payment Circuit Breaker: fail after 3 timeouts│
+└────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Target Architecture Diagram
+## Component Reference Table
 
-```
-                    ┌─────────────────┐
-                    │   Internet      │
-                    └────────┬────────┘
-                             │
-              ┌──────────────▼──────────────┐
-              │  CloudFront (Global CDN)    │
-              │  - Edge caching             │
-              │  - DDoS protection          │
-              └──────────────┬──────────────┘
-                             │
-              ┌──────────────▼──────────────┐
-              │  ALB (us-east-1)            │
-              │  - Health checks every 10s  │
-              └──────────────┬──────────────┘
-                             │
-         ┌───────────────────┼────────────────────┐
-         │                   │                    │
-    ┌────▼────┐         ┌────▼────┐        ┌────▼────┐
-    │ t3.med  │         │ t3.med  │        │ t3.med  │
-    │ Node.js │         │ Node.js │  ...   │ Node.js │
-    └────┬────┘         └────┬────┘        └────┬────┘
-         │                   │                    │
-         └───────────────────┼────────────────────┘
-                             │
-          ┏━━━━━━━━━━━━━━━━━━┻━━━━━━━━━━━━━━━━━━┓
-          ┃                                      ┃
-   ┌──────▼────────┐                   ┌─────────▼────────┐
-   │ Redis Cluster │                   │ RDS PostgreSQL   │
-   │ cache.r6g.lg  │                   │ db.r5.xlarge     │
-   │               │                   │                  │
-   │ [Locks+Cache] │                   │ [Primary Write]  │
-   └───────────────┘                   └─────────┬────────┘
-                                                 │
-                                      ┌──────────┴──────────┐
-                                      │                     │
-                              ┌───────▼──────┐      ┌──────▼──────┐
-                              │ Read Replica │      │Read Replica │
-                              │ db.t4g.large │      │db.t4g.large │
-                              └──────────────┘      └─────────────┘
-
-   ┌────────────────────────────────────────────────────────┐
-   │  Background Processing Pipeline                        │
-   │                                                        │
-   │  ┌──────────┐      ┌──────────────┐                  │
-   │  │   SQS    │─────►│ Lambda Worker│──┐               │
-   │  │  Queue   │      │   (Pool: 50) │  │               │
-   │  └──────────┘      └──────────────┘  │               │
-   │       │                               │               │
-   │       │ (DLQ)                         │               │
-   │  ┌────▼─────┐                         │               │
-   │  │ SQS DLQ  │                         │               │
-   │  │ (Manual) │              ┌──────────▼─────────────┐ │
-   │  └──────────┘              │ Payment Gateway API    │ │
-   │                            │ (External Service)     │ │
-   │                            └────────────────────────┘ │
-   └────────────────────────────────────────────────────────┘
-```
+| Component | Purpose | Scaling Strategy | Related Part A Decision |
+|-----------|---------|------------------|------------------------|
+| **CloudFront CDN** | Cache static assets + event listings at edge locations | AWS-managed global auto-scale | Cache-aside pattern (CACHE.md) |
+| **Application Load Balancer** | Distribute traffic across Node.js instances | AWS-managed horizontal scaling | Stateless API design (README.md) |
+| **Node.js API Servers** | Handle booking/event/user API requests | Horizontal auto-scale (2-12 instances) | 25K RPS target (README.md) |
+| **ElastiCache Redis** | Distributed locks + cache layer | Vertical scaling (instance upgrade) | SETNX locking (CONCURRENCY.md) |
+| **PostgreSQL Primary** | Authoritative seat inventory + bookings | Vertical scaling (32GB RAM, 4 vCPU) | UUID keys + version (SCHEMA.md) |
+| **Read Replicas (2x)** | Offload analytics/dashboard queries | Async replication from primary | Analytics separation (SCHEMA.md) |
+| **SQS Payment Queue** | Decouple booking from payment processing | AWS-managed infinite throughput | Async payments (QUEUE.md) |
+| **Lambda Workers** | Process payments with retry logic | Auto-scale 5-50 concurrent executions | IdempotencyKey (QUEUE.md) |
+| **SQS DLQ** | Manual reconciliation for failed payments | AWS-managed retention (24h) | MaxReceiveCount=3 (QUEUE.md) |
+| **SNS + SES** | Send booking confirmations via email/SMS | AWS-managed pub/sub | Post-payment notifications |
+| **CloudWatch + X-Ray** | Monitor metrics + distributed tracing | AWS-managed observability | Operational visibility |
 
 ---
 

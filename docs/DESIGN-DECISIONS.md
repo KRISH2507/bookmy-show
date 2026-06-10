@@ -1,219 +1,134 @@
-# Engineering Decision Log
+# Design Decisions
 
-## Decision 1: PostgreSQL vs NoSQL
+## Decision 1: Redis SETNX vs PostgreSQL FOR UPDATE
 
-### Alternatives Considered
-- PostgreSQL (RDBMS)
-- MongoDB (Document store)
-- DynamoDB (Key-value, AWS-native)
+**Context:** Need distributed locking for 25K RPS without exhausting connections.
 
-### Pros & Cons
+**Options:**
+- A) PostgreSQL SELECT FOR UPDATE
+- B) Redis SETNX distributed locks
 
-**PostgreSQL:**
-- ✅ ACID transactions (critical for bookings)
-- ✅ Foreign keys prevent orphaned records
-- ✅ Complex queries for analytics
-- ✅ Mature tooling (pgAdmin, monitoring)
-- ❌ Vertical scaling limits
+**Why Chosen:** Redis SETNX
+- Postgres exhausts at 3K RPS (needs 4,400 connections at 25K RPS)
+- Redis handles 100K+ ops/sec, only 50K needed
+- TTL auto-expires locks on crashes
 
-**MongoDB:**
-- ✅ Horizontal sharding
-- ✅ Flexible schema
-- ❌ No ACID across documents (before v4.2)
-- ❌ Complex two-phase commit for consistency
+**Tradeoffs:** Separate service to manage, Redis-Postgres consistency gap
 
-**DynamoDB:**
-- ✅ Serverless, infinite scale
-- ✅ Single-digit millisecond latency
-- ❌ No JOIN support
-- ❌ Transaction cost (5x normal reads/writes)
-- ❌ Expensive for scan-heavy queries
-
-### Final Justification
-**Choice: PostgreSQL**
-
-Booking systems are transactional by nature. PostgreSQL's row-level locking, foreign key constraints, and CHECK constraints eliminate entire classes of bugs. The seat inventory fits in 32GB RAM (cache-friendly). NoSQL benefits (horizontal scaling) don't outweigh ACID guarantees for this use case.
+**Revision Trigger:** If Redis becomes single point of failure
 
 ---
 
-## Decision 2: Redis for Distributed Locking
+## Decision 2: TTL-based Cache vs Event-driven
 
-### Alternatives Considered
-- PostgreSQL SELECT FOR UPDATE
-- Redis SETNX
-- Memcached (no lock primitive)
-- ZooKeeper/etcd (coordination service)
+**Context:** Cache invalidation strategy for event/seat data.
 
-### Pros & Cons
+**Options:**
+- A) TTL-only (time-based expiry)
+- B) Event-driven invalidation on every write
 
-**PostgreSQL Locks:**
-- ✅ Native to data store
-- ✅ Perfect consistency
-- ❌ Connection pool exhaustion (4,400 needed at peak)
+**Why Chosen:** TTL-based (60s for seat counts, 1h for events)
+- Simpler implementation
+- Approximate counts acceptable during rush
+- Short TTL balances freshness vs load
 
-**Redis SETNX:**
-- ✅ 100K+ ops/sec throughput
-- ✅ Automatic TTL expiry
-- ✅ Lua scripts for atomic unlock
-- ❌ Requires separate service
+**Tradeoffs:** Stale data possible for 60s
 
-**ZooKeeper:**
-- ✅ Leader election, strong consistency
-- ❌ Overkill for this use case
-- ❌ Additional ops complexity
-
-### Final Justification
-**Choice: Redis SETNX**
-
-PostgreSQL locks scale to ~3K RPS before connection exhaustion. Redis handles 25K RPS with headroom. The hybrid approach (Redis locks + Postgres persistence) provides both throughput AND consistency. Lock failures are fast (NOWAIT semantics), enabling quick retries.
+**Revision Trigger:** If stale data causes user complaints
 
 ---
 
-## Decision 3: Async Payment Processing
+## Decision 3: UUID vs SERIAL for Booking IDs
 
-### Alternatives Considered
-- Synchronous payment (block until gateway responds)
-- Message queue (SQS + Lambda)
-- Background job processor (Celery, Bull)
+**Context:** Primary key strategy for distributed system.
 
-### Pros & Cons
+**Options:**
+- A) SERIAL (auto-increment)
+- B) UUID v4
 
-**Synchronous:**
-- ✅ Simple code flow
-- ❌ Holds connections for 2-5s (kills throughput)
-- ❌ No retry on failure
-- ❌ Client timeout issues
+**Why Chosen:** UUID
+- Prevents enumeration attacks
+- Distributed-safe (no central sequence)
+- Merge-friendly for sharding
 
-**SQS + Lambda:**
-- ✅ Auto-scaling workers
-- ✅ Built-in retry + DLQ
-- ✅ Pay-per-invocation (cost-efficient)
-- ❌ Cold start latency (mitigated with reserved concurrency)
+**Tradeoffs:** 16 bytes vs 8 bytes (larger indexes)
 
-**Self-hosted Queue (Bull/Redis):**
-- ✅ More control
-- ❌ Need to manage workers
-- ❌ Scaling complexity
-
-### Final Justification
-**Choice: SQS + Lambda**
-
-Payment gateways are the slowest component (3s P99). Async processing decouples booking reservation from payment confirmation. SQS provides infinite buffer, Lambda scales automatically. Cost: $150/month for 5K payments (within budget). Synchronous would require 15K connections—infeasible.
+**Revision Trigger:** If index size becomes bottleneck
 
 ---
 
-## Decision 4: Read Replicas for Analytics
+## Decision 4: SQS Visibility Timeout = 30s
 
-### Alternatives Considered
-- Single primary for all queries
-- Read replicas (async replication)
-- Separate data warehouse (Redshift)
+**Context:** How long to hide message after worker receives it.
 
-### Pros & Cons
+**Options:**
+- A) 10s (too short)
+- B) 30s
+- C) 60s (too long)
 
-**Single Primary:**
-- ✅ No replication lag
-- ❌ Analytics queries starve booking writes
+**Why Chosen:** 30s
+- Payment gateway: 10s timeout
+- DB write: 2s
+- Buffer: 18s for retries
 
-**Read Replicas:**
-- ✅ Offload read traffic (dashboards, reports)
-- ✅ Cost-effective (t4g.large vs r5.xlarge)
-- ❌ Replication lag (5-10s acceptable for analytics)
+**Tradeoffs:** Failed workers block messages for 30s
 
-**Redshift:**
-- ✅ Columnar storage for OLAP
-- ❌ $500+/month (over budget)
-- ❌ Overkill for this scale
-
-### Final Justification
-**Choice: 2x Read Replicas**
-
-Booking writes target primary. Admin dashboards, user history, and event listings read from replicas. Saves $300/month vs scaling primary. Replication lag doesn't affect critical path (seat availability queries hit primary).
+**Revision Trigger:** If payment latency exceeds 20s consistently
 
 ---
 
-## Decision 5: Cache Strategy (Cache-Aside)
+## Decision 5: Async Payment vs Synchronous
 
-### Alternatives Considered
-- No cache (direct DB queries)
-- Write-through cache
-- Cache-aside (lazy load)
+**Context:** Payment gateway takes 3s, would block connections.
 
-### Pros & Cons
+**Options:**
+- A) Synchronous (wait for payment)
+- B) Async via SQS
 
-**No Cache:**
-- ✅ Simple, no consistency issues
-- ❌ DB overload (25K RPS × 20ms = 500 connections)
+**Why Chosen:** Async SQS
+- Synchronous needs 15K connections (kills app)
+- Async reserves seat in 200ms, queues payment
+- Retry logic + DLQ for failures
 
-**Write-Through:**
-- ✅ Cache always fresh
-- ❌ Slower writes (update cache + DB)
-- ❌ Cache pollution (one-time reads cached)
+**Tradeoffs:** User waits ~5s for confirmation
 
-**Cache-Aside:**
-- ✅ Only cache hot data
-- ✅ Fast reads (Redis <5ms)
-- ❌ Cache stampede risk (mitigated with locking)
-
-### Final Justification
-**Choice: Cache-Aside**
-
-Event details are read 1000x more than written. Lazy loading avoids caching unpopular events. Short TTL (60s) for seat counts prevents stale data during rush. Individual seat status NOT cached (consistency nightmare). Redis reduces DB load by 90%.
+**Revision Trigger:** If 5s wait time unacceptable
 
 ---
 
-## Decision 6: UUID vs SERIAL Primary Keys
+## Decision 6: Read Replicas vs Larger Primary
 
-### Alternatives Considered
-- SERIAL (auto-increment integers)
-- UUID v4 (random)
+**Context:** Separate analytics from transactional queries.
 
-### Pros & Cons
+**Options:**
+- A) Single large primary (db.r5.2xlarge @ $1200/mo)
+- B) Primary + 2x read replicas ($580 + $280)
 
-**SERIAL:**
-- ✅ Compact (8 bytes)
-- ✅ Sequential (B-tree friendly)
-- ❌ Enumeration attacks (user IDs guessable)
-- ❌ Merge conflicts in distributed writes
+**Why Chosen:** Read replicas
+- $360/mo savings
+- Analytics don't affect booking writes
+- 5s replication lag acceptable for dashboards
 
-**UUID:**
-- ✅ Globally unique (safe for sharding)
-- ✅ Non-guessable (security)
-- ❌ 16 bytes (larger indexes)
-- ❌ Random (less cache-friendly)
+**Tradeoffs:** Eventual consistency for reports
 
-### Final Justification
-**Choice: UUID (gen_random_uuid)**
-
-Security matters for user-facing IDs. Prevents account enumeration. Future-proofs for multi-region sharding (single sequence generator becomes bottleneck). Index size cost (8GB vs 4GB) is acceptable at this scale.
+**Revision Trigger:** If replication lag > 30s
 
 ---
 
-## Decision 7: Node.js vs Other Runtimes
+## Decision 7: Redis Seat Holds vs DB-based
 
-### Alternatives Considered
-- Node.js (Express)
-- Go (Gin)
-- Java (Spring Boot)
+**Context:** Where to enforce 10-minute seat hold TTL.
 
-### Pros & Cons
+**Options:**
+- A) Redis TTL only
+- B) DB held_until column only
+- C) Both (hybrid)
 
-**Node.js:**
-- ✅ Event-driven, non-blocking I/O
-- ✅ Fast prototyping (large ecosystem)
-- ❌ Single-threaded (CPU-bound tasks slow)
+**Why Chosen:** Hybrid (Redis lock + DB held_until)
+- Redis: fast distributed lock (15s TTL)
+- DB: authoritative state (10min hold)
+- Background job expires DB holds
 
-**Go:**
-- ✅ Compiled, low memory
-- ✅ Goroutines (excellent concurrency)
-- ❌ Smaller ecosystem
+**Tradeoffs:** Dual management complexity
 
-**Java:**
-- ✅ Battle-tested for high scale
-- ❌ High memory usage (1GB+ per instance)
-- ❌ Longer startup time
-
-### Final Justification
-**Choice: Node.js**
-
-Booking API is I/O-bound (DB + Redis + payment gateway). Node.js async model fits perfectly. Rapid development (tight deadline). t3.medium instances handle 2K RPS each (sufficient). For CPU-heavy analytics, offload to Lambda (Python/Go).
+**Revision Trigger:** If Redis-DB sync issues frequent
